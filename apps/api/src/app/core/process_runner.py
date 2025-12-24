@@ -587,6 +587,10 @@ class ProcessRunner:
             await asyncio.sleep(5)
 
             if self._state == ProcessState.READY:
+                # Don't kill if there are pending requests (in-flight)
+                if self._pending_requests:
+                    continue
+
                 idle_time = time.time() - self._last_used
                 # Use adaptive TTL if enabled, otherwise fall back to config
                 effective_ttl = self._current_ttl if self.config.adaptive_ttl_enabled else self.config.idle_timeout

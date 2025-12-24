@@ -102,6 +102,7 @@ class DynamicMCP:
                 print(f"[DynamicMCP] Failed to cache tools for {name}: {e}")
 
         # Cache Docker MCP Gateway tools
+        docker_server_tools: dict[str, int] = {}  # server_name -> tools_count
         if docker_tools:
             for tool in docker_tools:
                 tool_name = tool.get("name", "")
@@ -118,10 +119,125 @@ class DynamicMCP:
                     )
                     self._tool_to_server[tool_name] = server_name
 
+                    # Count tools per Docker server
+                    docker_server_tools[server_name] = docker_server_tools.get(server_name, 0) + 1
+
+            # Add Docker servers to server cache
+            for server_name, tools_count in docker_server_tools.items():
+                if server_name not in self._servers:
+                    self._servers[server_name] = ServerInfo(
+                        name=server_name,
+                        enabled=True,
+                        mode="docker",  # Docker servers are always running
+                        tools_count=tools_count,
+                        source="docker"
+                    )
+
         print(f"[DynamicMCP] Cached {len(self._tools)} tools from {len(self._servers)} servers")
+
+    async def refresh_cache_hot_only(
+        self,
+        process_manager,
+        docker_tools: Optional[list[dict]] = None
+    ):
+        """
+        Refresh cache with HOT servers only (fast, no cold server startup).
+
+        Cold server tools will be loaded on-demand via airis-find.
+        Uses atomic update to avoid race conditions.
+
+        Args:
+            process_manager: ProcessManager instance
+            docker_tools: Tools from Docker MCP Gateway (optional)
+        """
+        # Build new cache in temporary variables (atomic update pattern)
+        new_tools: dict[str, ToolInfo] = {}
+        new_servers: dict[str, ServerInfo] = {}
+        new_tool_to_server: dict[str, str] = {}
+
+        # Cache ALL server info (but only HOT server tools)
+        hot_servers = process_manager.get_hot_servers()
+        for name in process_manager.get_enabled_servers():
+            status = process_manager.get_server_status(name)
+            is_hot = name in hot_servers
+
+            new_servers[name] = ServerInfo(
+                name=name,
+                enabled=status.get("enabled", False),
+                mode="hot" if is_hot else "cold",
+                tools_count=status.get("tools_count", 0),
+                source="process"
+            )
+
+            # Only get tools from HOT servers (already running)
+            if is_hot:
+                try:
+                    tools = await process_manager._list_tools_for_server(name)
+                    for tool in tools:
+                        tool_name = tool.get("name", "")
+                        if tool_name:
+                            new_tools[tool_name] = ToolInfo(
+                                name=tool_name,
+                                server=name,
+                                description=tool.get("description", ""),
+                                input_schema=tool.get("inputSchema", {}),
+                                source="process"
+                            )
+                            new_tool_to_server[tool_name] = name
+                except Exception as e:
+                    print(f"[DynamicMCP] Failed to cache HOT tools for {name}: {e}")
+
+        # Cache Docker MCP Gateway tools
+        docker_server_tools: dict[str, int] = {}
+        if docker_tools:
+            for tool in docker_tools:
+                tool_name = tool.get("name", "")
+                if tool_name and tool_name not in new_tools:
+                    server_name = self._infer_server_name(tool_name)
+                    new_tools[tool_name] = ToolInfo(
+                        name=tool_name,
+                        server=server_name,
+                        description=tool.get("description", ""),
+                        input_schema=tool.get("inputSchema", {}),
+                        source="docker"
+                    )
+                    new_tool_to_server[tool_name] = server_name
+                    docker_server_tools[server_name] = docker_server_tools.get(server_name, 0) + 1
+
+            for server_name, tools_count in docker_server_tools.items():
+                if server_name not in new_servers:
+                    new_servers[server_name] = ServerInfo(
+                        name=server_name,
+                        enabled=True,
+                        mode="docker",
+                        tools_count=tools_count,
+                        source="docker"
+                    )
+
+        # Atomic swap - replace all caches at once
+        self._tools = new_tools
+        self._servers = new_servers
+        self._tool_to_server = new_tool_to_server
+
+        print(f"[DynamicMCP] Cached {len(self._tools)} HOT tools from {len(self._servers)} servers (COLD tools on-demand)")
 
     def _infer_server_name(self, tool_name: str) -> str:
         """Infer server name from tool name pattern."""
+        # Known Docker server tool prefixes mapping
+        # mindbase tools: conversation_, session_, memory_
+        docker_tool_prefixes = {
+            "conversation_": "mindbase",
+            "session_": "mindbase",
+            "memory_": "mindbase",
+            "get_current_time": "time",
+            "convert_time": "time",
+        }
+
+        # Check known prefixes first
+        for prefix, server in docker_tool_prefixes.items():
+            if tool_name.startswith(prefix) or tool_name == prefix.rstrip("_"):
+                return server
+
         # Common patterns: server_action, serverAction
         if "_" in tool_name:
             return tool_name.split("_")[0]

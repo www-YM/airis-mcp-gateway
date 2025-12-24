@@ -20,6 +20,153 @@ MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "http://gateway:9390")
 MCP_CONFIG_PATH = os.getenv("MCP_CONFIG_PATH", "/app/mcp-config.json")
 
 
+async def _precache_docker_gateway_tools():
+    """
+    Background task to pre-cache Docker Gateway tools at startup.
+
+    MCP SSE Protocol requires keeping the GET stream open while POSTing.
+    This function uses a concurrent approach:
+    1. Open GET /sse stream (kept open for responses)
+    2. Parse endpoint event to get session URL
+    3. POST initialize, initialized, tools/list
+    4. Continue reading GET stream for tools/list response
+    """
+    import asyncio
+    import json
+
+    # Wait for Gateway to be fully ready
+    await asyncio.sleep(2.0)
+
+    gateway_url = MCP_GATEWAY_URL.rstrip("/")
+    print(f"[Startup] Pre-caching Docker Gateway tools...")
+
+    docker_tools = []
+    endpoint_url = None
+    event_type = None
+
+    async def send_requests(client, endpoint):
+        """Send MCP protocol requests."""
+        await asyncio.sleep(0.3)  # Wait for stream to establish
+
+        # Initialize
+        init_request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "airis-startup", "version": "1.0.0"}
+            }
+        }
+        await client.post(
+            endpoint,
+            json=init_request,
+            headers={"Content-Type": "application/json"}
+        )
+        await asyncio.sleep(0.2)
+
+        # Initialized notification
+        await client.post(
+            endpoint,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            headers={"Content-Type": "application/json"}
+        )
+        await asyncio.sleep(0.2)
+
+        # tools/list
+        await client.post(
+            endpoint,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={"Content-Type": "application/json"}
+        )
+        print(f"[Startup] Sent all requests to {endpoint}")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Open SSE stream and keep it open while processing
+            async with client.stream(
+                "GET",
+                f"{gateway_url}/sse",
+                headers={"Accept": "text/event-stream"},
+                timeout=15.0
+            ) as response:
+                sender_task = None
+                async for line in response.aiter_lines():
+                    line = line.strip()
+
+                    # Parse event type
+                    if line.startswith("event:"):
+                        event_type = line[6:].strip()
+                        continue
+
+                    # Parse data
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+
+                        # Endpoint event - start sending requests
+                        if event_type == "endpoint":
+                            endpoint_url = f"{gateway_url}{data_str}"
+                            print(f"[Startup] Got endpoint: {endpoint_url}")
+                            # Start sending requests in background
+                            sender_task = asyncio.create_task(send_requests(client, endpoint_url))
+                            continue
+
+                        # JSON response - look for tools/list
+                        if data_str.startswith("{"):
+                            try:
+                                data = json.loads(data_str)
+                                if data.get("id") == 2 and "result" in data:
+                                    docker_tools = data["result"].get("tools", [])
+                                    print(f"[Startup] Received {len(docker_tools)} tools from Gateway")
+                                    break
+                            except json.JSONDecodeError:
+                                pass
+
+                # Cancel sender if still running
+                if sender_task and not sender_task.done():
+                    sender_task.cancel()
+
+            if docker_tools:
+                # Cache Docker tools in DynamicMCP
+                from .core.dynamic_mcp import get_dynamic_mcp, ToolInfo, ServerInfo
+                dynamic_mcp = get_dynamic_mcp()
+
+                docker_server_tools = {}
+                for tool in docker_tools:
+                    tool_name = tool.get("name", "")
+                    if tool_name and tool_name not in dynamic_mcp._tools:
+                        server_name = dynamic_mcp._infer_server_name(tool_name)
+                        dynamic_mcp._tools[tool_name] = ToolInfo(
+                            name=tool_name,
+                            server=server_name,
+                            description=tool.get("description", ""),
+                            input_schema=tool.get("inputSchema", {}),
+                            source="docker"
+                        )
+                        dynamic_mcp._tool_to_server[tool_name] = server_name
+                        docker_server_tools[server_name] = docker_server_tools.get(server_name, 0) + 1
+
+                for server_name, tools_count in docker_server_tools.items():
+                    if server_name not in dynamic_mcp._servers:
+                        dynamic_mcp._servers[server_name] = ServerInfo(
+                            name=server_name,
+                            enabled=True,
+                            mode="docker",
+                            tools_count=tools_count,
+                            source="docker"
+                        )
+
+                print(f"[Startup] Pre-cached {len(docker_tools)} Docker Gateway tools from {len(docker_server_tools)} servers")
+            else:
+                print("[Startup] No Docker Gateway tools found in response")
+
+    except Exception as e:
+        import traceback
+        print(f"[Startup] Docker Gateway pre-cache failed: {e}")
+        print(f"[Startup] Traceback: {traceback.format_exc()}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("AIRIS MCP Gateway API starting")
@@ -41,6 +188,11 @@ async def lifespan(app: FastAPI):
             prewarm_status = await manager.prewarm_hot_servers()
             ready = sum(1 for v in prewarm_status.values() if v)
             print(f"   Pre-warm complete: {ready}/{len(hot_servers)} servers ready")
+
+        # Start background task to pre-cache Docker Gateway tools
+        import asyncio
+        asyncio.create_task(_precache_docker_gateway_tools())
+
     except Exception as e:
         print(f"   ProcessManager init failed: {e}")
 
