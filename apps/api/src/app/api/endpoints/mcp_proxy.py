@@ -418,6 +418,22 @@ async def apply_prompts_merging(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+async def _refresh_dynamic_mcp_cache(process_manager, docker_tools: list):
+    """Background task to refresh Dynamic MCP cache without blocking response."""
+    try:
+        dynamic_mcp = get_dynamic_mcp()
+        await dynamic_mcp.refresh_cache_hot_only(process_manager, docker_tools)
+
+        # Store schemas for cached tools
+        for tool_name, tool_info in dynamic_mcp._tools.items():
+            schema_partitioner.store_full_schema(tool_name, tool_info.input_schema)
+            schema_partitioner.store_tool_description(tool_name, tool_info.description)
+
+        print(f"[Dynamic MCP] Background cache refresh complete: {len(dynamic_mcp._tools)} tools")
+    except Exception as e:
+        print(f"[Dynamic MCP] Background cache refresh failed: {e}")
+
+
 async def apply_schema_partitioning(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     tools/list レスポンスにschema partitioning適用 + Process MCPツール統合
@@ -435,27 +451,20 @@ async def apply_schema_partitioning(data: Dict[str, Any]) -> Dict[str, Any]:
     docker_tools = list(data["result"]["tools"])
     process_manager = get_process_manager()
 
-    # Dynamic MCP mode: return only meta-tools
+    # Dynamic MCP mode: return only meta-tools (FAST PATH)
     if settings.DYNAMIC_MCP:
         print("[Dynamic MCP] Mode enabled - returning meta-tools only")
 
-        # Get ALL tools for caching (from all enabled servers, not just HOT)
-        all_process_tools = await process_manager.list_tools(mode="all")
-
-        # Refresh Dynamic MCP cache with all available tools
+        # Return meta-tools IMMEDIATELY (no blocking operations)
         dynamic_mcp = get_dynamic_mcp()
-        await dynamic_mcp.refresh_cache(process_manager, docker_tools)
+        meta_tools = dynamic_mcp.get_meta_tools()
+        data["result"]["tools"] = meta_tools
+        print(f"[Dynamic MCP] Returning {len(meta_tools)} meta-tools immediately")
 
-        # Also store full schemas for airis-schema lookups
-        for tool in docker_tools + all_process_tools:
-            tool_name = tool.get("name", "")
-            if tool_name:
-                schema_partitioner.store_full_schema(tool_name, tool.get("inputSchema", {}))
-                schema_partitioner.store_tool_description(tool_name, tool.get("description", ""))
+        # Schedule background cache refresh (non-blocking)
+        import asyncio
+        asyncio.create_task(_refresh_dynamic_mcp_cache(process_manager, docker_tools))
 
-        # Return only meta-tools
-        data["result"]["tools"] = dynamic_mcp.get_meta_tools()
-        print(f"[Dynamic MCP] Cached {len(docker_tools)} docker + {len(all_process_tools)} process tools, returning 3 meta-tools")
         return data
 
     # Standard mode: merge HOT tools and apply schema partitioning
@@ -936,13 +945,13 @@ async def _proxy_jsonrpc_request(request: Request) -> Response:
 
         # Dynamic MCP meta-tools (only when DYNAMIC_MCP=true)
         if tool_name == "airis-find":
-            return await handle_airis_find(rpc_request)
+            return await handle_airis_find(rpc_request, session_id=session_id)
 
         if tool_name == "airis-exec":
             return await handle_airis_exec(rpc_request, session_id=session_id)
 
         if tool_name == "airis-schema":
-            return await handle_airis_schema(rpc_request)
+            return await handle_airis_schema(rpc_request, session_id=session_id)
 
     # prompts/get リクエスト処理
     if rpc_request.get("method") == "prompts/get":
@@ -1142,12 +1151,13 @@ async def proxy_root_well_known(request: Request, path: str) -> Response:
     )
 
 
-async def handle_airis_find(rpc_request: Dict[str, Any]) -> Response:
+async def handle_airis_find(rpc_request: Dict[str, Any], session_id: Optional[str] = None) -> Response:
     """
     airis-find ツールコール: ツール/サーバー検索
 
     Args:
         rpc_request: JSON-RPC 2.0 リクエスト
+        session_id: SSE session ID for response routing
 
     Returns:
         JSON-RPC 2.0 レスポンス
@@ -1240,14 +1250,24 @@ async def handle_airis_find(rpc_request: Dict[str, Any]) -> Response:
 
     response_text = "\n".join(lines)
 
+    response_data = {
+        "jsonrpc": "2.0",
+        "id": rpc_request.get("id"),
+        "result": {
+            "content": [{"type": "text", "text": response_text}]
+        }
+    }
+
+    # MCP SSE Transport: Response via SSE stream
+    if session_id:
+        queue = get_response_queue(session_id)
+        await queue.put(response_data)
+        print(f"[Dynamic MCP] Queued airis-find response for session {session_id}")
+        return Response(status_code=202)
+
+    # Fallback to HTTP response if no session_id
     return Response(
-        content=json.dumps({
-            "jsonrpc": "2.0",
-            "id": rpc_request.get("id"),
-            "result": {
-                "content": [{"type": "text", "text": response_text}]
-            }
-        }),
+        content=json.dumps(response_data),
         status_code=200,
         media_type="application/json"
     )
@@ -1403,12 +1423,13 @@ async def handle_airis_exec(rpc_request: Dict[str, Any], session_id: Optional[st
         )
 
 
-async def handle_airis_schema(rpc_request: Dict[str, Any]) -> Response:
+async def handle_airis_schema(rpc_request: Dict[str, Any], session_id: Optional[str] = None) -> Response:
     """
     airis-schema ツールコール: ツールのスキーマを取得
 
     Args:
         rpc_request: JSON-RPC 2.0 リクエスト
+        session_id: SSE session ID for response routing
 
     Returns:
         JSON-RPC 2.0 レスポンス
@@ -1419,12 +1440,17 @@ async def handle_airis_schema(rpc_request: Dict[str, Any]) -> Response:
     tool_ref = arguments.get("tool")
 
     if not tool_ref:
+        error_data = {
+            "jsonrpc": "2.0",
+            "id": rpc_request.get("id"),
+            "error": {"code": -32602, "message": "tool is required"}
+        }
+        if session_id:
+            queue = get_response_queue(session_id)
+            await queue.put(error_data)
+            return Response(status_code=202)
         return Response(
-            content=json.dumps({
-                "jsonrpc": "2.0",
-                "id": rpc_request.get("id"),
-                "error": {"code": -32602, "message": "tool is required"}
-            }),
+            content=json.dumps(error_data),
             status_code=200,
             media_type="application/json"
         )
@@ -1447,15 +1473,20 @@ async def handle_airis_schema(rpc_request: Dict[str, Any]) -> Response:
             }
 
     if not schema:
+        error_data = {
+            "jsonrpc": "2.0",
+            "id": rpc_request.get("id"),
+            "error": {
+                "code": -32602,
+                "message": f"Schema not found for tool: {tool_ref}. Use airis-find to discover available tools."
+            }
+        }
+        if session_id:
+            queue = get_response_queue(session_id)
+            await queue.put(error_data)
+            return Response(status_code=202)
         return Response(
-            content=json.dumps({
-                "jsonrpc": "2.0",
-                "id": rpc_request.get("id"),
-                "error": {
-                    "code": -32602,
-                    "message": f"Schema not found for tool: {tool_ref}. Use airis-find to discover available tools."
-                }
-            }),
+            content=json.dumps(error_data),
             status_code=200,
             media_type="application/json"
         )
@@ -1474,14 +1505,24 @@ async def handle_airis_schema(rpc_request: Dict[str, Any]) -> Response:
         "```"
     ]
 
+    response_data = {
+        "jsonrpc": "2.0",
+        "id": rpc_request.get("id"),
+        "result": {
+            "content": [{"type": "text", "text": "\n".join(lines)}]
+        }
+    }
+
+    # MCP SSE Transport: Response via SSE stream
+    if session_id:
+        queue = get_response_queue(session_id)
+        await queue.put(response_data)
+        print(f"[Dynamic MCP] Queued airis-schema response for session {session_id}")
+        return Response(status_code=202)
+
+    # Fallback to HTTP response if no session_id
     return Response(
-        content=json.dumps({
-            "jsonrpc": "2.0",
-            "id": rpc_request.get("id"),
-            "result": {
-                "content": [{"type": "text", "text": "\n".join(lines)}]
-            }
-        }),
+        content=json.dumps(response_data),
         status_code=200,
         media_type="application/json"
     )
