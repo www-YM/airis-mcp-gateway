@@ -1260,12 +1260,20 @@ async def handle_airis_find(rpc_request: Dict[str, Any], session_id: Optional[st
         cold_servers = process_manager.get_cold_servers()
         enabled_servers = process_manager.get_enabled_servers()
 
+        # Split query into words for flexible matching
+        query_words = query_lower.split()
+
         for server_name in cold_servers:
-            # Only match enabled COLD servers (bi-directional matching)
-            # "tavily" in "tavily search" OR "chrome" in "chrome-devtools"
+            if server_name not in enabled_servers:
+                continue
             server_lower = server_name.lower()
-            if server_name in enabled_servers and (server_lower in query_lower or query_lower in server_lower):
-                matched_cold_servers.append(server_name)
+            # Check if any query word matches server name (bi-directional)
+            # "chrome browser" → "chrome" matches "chrome-devtools"
+            # "tavily search" → "tavily" matches "tavily"
+            for word in query_words:
+                if len(word) >= 3 and (word in server_lower or server_lower in word):
+                    matched_cold_servers.append(server_name)
+                    break
 
         # Auto-load matched COLD servers
         for server_name in matched_cold_servers:
