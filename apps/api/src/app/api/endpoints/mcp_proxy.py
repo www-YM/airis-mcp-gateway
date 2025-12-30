@@ -1192,11 +1192,12 @@ async def handle_airis_find(rpc_request: Dict[str, Any], session_id: Optional[st
 
     # Auto-refresh ProcessManager tools if not yet cached
     # (Docker Gateway tools may be pre-cached at startup, but we still need ProcessManager tools)
+    # Only load HOT servers here - COLD servers are loaded on-demand by smart discovery
     has_process_tools = any(t.source == "process" for t in dynamic_mcp._tools.values())
     if not has_process_tools:
-        print("[Dynamic MCP] No ProcessManager tools in cache, refreshing from all enabled process servers...")
-        # Load tools from ALL enabled servers (both HOT and COLD)
-        all_tools = await process_manager.list_tools(mode="all")
+        print("[Dynamic MCP] No ProcessManager tools in cache, refreshing from HOT servers...")
+        # Load tools from HOT servers only - COLD servers loaded on-demand
+        all_tools = await process_manager.list_tools(mode="hot")
         for tool in all_tools:
             tool_name = tool.get("name", "")
             server_name = process_manager._tool_to_server.get(tool_name, "unknown")
@@ -1229,8 +1230,10 @@ async def handle_airis_find(rpc_request: Dict[str, Any], session_id: Optional[st
             server_info = dynamic_mcp._servers[server]
             print(f"[Dynamic MCP] Added server '{server}' to cache (mode={server_info.mode})")
 
-        # If it's a COLD server with no tools, start it and cache tools
-        if is_process and server_info and server_info.mode == "cold" and server_info.tools_count == 0:
+        # If it's a COLD server with no tools cached, start it and cache tools
+        # Note: tools_count is metadata, we need to check if tools are actually in _tools dict
+        server_has_tools = any(t.server == server for t in dynamic_mcp._tools.values())
+        if is_process and server_info and server_info.mode == "cold" and not server_has_tools:
             print(f"[Dynamic MCP] Starting COLD server '{server}' to get tools...")
             server_tools = await process_manager._list_tools_for_server(server)
             for tool in server_tools:
@@ -1269,6 +1272,13 @@ async def handle_airis_find(rpc_request: Dict[str, Any], session_id: Optional[st
 
     if not results['tools'] and not results['servers']:
         lines.append("No matches found. Try a different query or use airis-find without arguments to list all.")
+        # Show hint about available COLD servers
+        if not server:
+            cold_servers = process_manager.get_cold_servers()
+            enabled_cold = [s for s in cold_servers if s in process_manager.get_enabled_servers()]
+            if enabled_cold:
+                lines.append(f"\nTip: COLD servers available: {', '.join(enabled_cold)}")
+                lines.append("Use `server` parameter to load specific server, e.g., airis-find server=\"tavily\"")
 
     response_text = "\n".join(lines)
 
