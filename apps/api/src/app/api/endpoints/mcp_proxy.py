@@ -309,20 +309,22 @@ async def proxy_sse_stream(request: Request):
             gateway_task = None
             queue_task = None
             keepalive_task = None
+            gateway_stream_alive = True  # Track gateway stream health
 
             try:
                 while True:
                     # Start tasks if needed
-                    if gateway_task is None:
+                    if gateway_task is None and gateway_stream_alive:
                         gateway_task = asyncio.create_task(gateway_gen.__anext__())
                     if queue_task is None:
                         queue_task = asyncio.create_task(queue_gen.__anext__())
                     if keepalive_task is None:
                         keepalive_task = asyncio.create_task(keepalive_gen.__anext__())
 
-                    # Wait for any to complete
+                    # Wait for any to complete (only include active tasks)
+                    tasks_to_wait = [t for t in [gateway_task, queue_task, keepalive_task] if t is not None]
                     done, _ = await asyncio.wait(
-                        [gateway_task, queue_task, keepalive_task],
+                        tasks_to_wait,
                         return_when=asyncio.FIRST_COMPLETED
                     )
 
@@ -330,23 +332,47 @@ async def proxy_sse_stream(request: Request):
                         try:
                             source, data = task.result()
                         except StopAsyncIteration:
-                            # Gateway stream ended
+                            if task is gateway_task:
+                                # Gateway stream ended — continue serving process manager responses
+                                logger.info(f"Gateway SSE stream ended, continuing with process manager (session={captured_session_id})")
+                                gateway_task = None
+                                gateway_stream_alive = False
+                                continue
+                            # Queue or keepalive generator ended (shouldn't happen)
                             if captured_session_id:
                                 await remove_response_queue(captured_session_id)
                             return
                         except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                            if task is gateway_task:
+                                # Gateway connection lost — continue with process manager
+                                logger.info(f"Gateway disconnected ({type(e).__name__}), continuing with process manager (session={captured_session_id})")
+                                gateway_task = None
+                                gateway_stream_alive = False
+                                continue
                             # Client disconnected - this is normal, exit gracefully
                             logger.info(f"Client disconnected: {type(e).__name__}")
                             if captured_session_id:
                                 await remove_response_queue(captured_session_id)
                             return
                         except httpx.ReadTimeout:
-                            # SSE read timeout - connection may be stale
+                            if task is gateway_task:
+                                # Gateway idle timeout — continue serving process manager responses
+                                # This is expected when only process manager tools are being used
+                                logger.info(f"Gateway SSE idle timeout, continuing with process manager (session={captured_session_id})")
+                                gateway_task = None
+                                gateway_stream_alive = False
+                                continue
+                            # Non-gateway timeout - clean up
                             logger.info(f"SSE read timeout (session={captured_session_id})")
                             if captured_session_id:
                                 await remove_response_queue(captured_session_id)
                             return
                         except httpx.TimeoutException as e:
+                            if task is gateway_task:
+                                logger.info(f"Gateway timeout ({type(e).__name__}), continuing with process manager (session={captured_session_id})")
+                                gateway_task = None
+                                gateway_stream_alive = False
+                                continue
                             # Other timeout (connect, pool, etc.)
                             logger.info(f"Timeout exception: {type(e).__name__}")
                             if captured_session_id:
@@ -367,7 +393,7 @@ async def proxy_sse_stream(request: Request):
                             # ProcessManager からのレスポンスを SSE で送信
                             queue_task = None
                             logger.info(f"Sending ProcessManager response via SSE: id={data.get('id') if isinstance(data, dict) else None}")
-                            yield f"data: {json.dumps(data)}\n\n"
+                            yield f"event: message\ndata: {json.dumps(data)}\n\n"
                             continue
 
                         # Gateway からのメッセージ
@@ -1459,6 +1485,12 @@ async def handle_airis_exec(rpc_request: Dict[str, Any], session_id: Optional[st
 
     tool_ref = arguments.get("tool")
     tool_args = arguments.get("arguments", {})
+    # Handle string-encoded JSON arguments (Claude Code may send "{}" instead of {})
+    if isinstance(tool_args, str):
+        try:
+            tool_args = json.loads(tool_args)
+        except (json.JSONDecodeError, TypeError):
+            tool_args = {}
 
     if not tool_ref:
         return Response(

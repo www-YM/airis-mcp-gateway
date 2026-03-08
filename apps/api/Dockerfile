@@ -115,7 +115,7 @@ RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 RUN useradd -m -u 1000 -s /bin/bash appuser
 
 # Create cache directories for appuser
-RUN mkdir -p /home/appuser/.cache/uv /home/appuser/.npm
+RUN mkdir -p /home/appuser/.cache/uv
 
 # Change ownership of app directories to appuser
 RUN chown -R appuser:appuser /app /home/appuser
@@ -125,6 +125,9 @@ USER appuser
 
 # Set HOME for uv/npm cache paths
 ENV HOME=/home/appuser
+
+# Use a temp-based npm cache to avoid root-owned cache from build stage
+ENV NPM_CONFIG_CACHE=/tmp/.npm-cache
 
 # API port
 EXPOSE 8000

@@ -343,7 +343,11 @@ class ProcessRunner:
             "params": {}
         }
 
-        response = await self._send_request(request, timeout=10.0)
+        try:
+            response = await self._send_request(request, timeout=10.0)
+        except Exception as e:
+            logger.error(f"{self.config.name} tools/list failed: {e}")
+            raise
 
         if "result" in response:
             self._tools = response["result"].get("tools", [])
@@ -396,7 +400,16 @@ class ProcessRunner:
             }
         }
 
-        return await self._send_request(request, timeout=30.0)
+        try:
+            return await self._send_request(request, timeout=30.0)
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32603,
+                    "message": f"prompts/get failed: {e}"
+                }
+            }
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any], max_retries: int = 2) -> dict[str, Any]:
         """
@@ -447,19 +460,15 @@ class ProcessRunner:
                 self._total_calls += 1
                 self._record_call()  # For adaptive TTL
 
-                # Check for process crash during call
-                if "error" in result:
-                    error_code = result.get("error", {}).get("code", 0)
-                    # Internal error or timeout - might be process crash
-                    if error_code in [-32603, -32000] and attempt < max_retries:
-                        last_error = result.get("error", {}).get("message", "Unknown error")
-                        logger.warning(f"{self.config.name} retry {attempt + 1}/{max_retries}: {last_error}")
-                        await self._restart_process()
-                        continue
-
+                # If _send_request returned (didn't raise), the subprocess responded
+                # via STDIO. Even if the response contains an error, the process is
+                # healthy — the error came from the remote server (e.g. mcp-remote
+                # forwarding a business error). Do NOT restart the process.
                 return result
 
             except asyncio.TimeoutError:
+                # No response from subprocess within timeout — likely process crash
+                # or hang. Restart and retry.
                 last_error = f"Request timeout after {settings.TOOL_CALL_TIMEOUT}s"
                 if attempt < max_retries:
                     logger.warning(f"{self.config.name} retry {attempt + 1}/{max_retries}: timeout, restarting")
@@ -474,6 +483,7 @@ class ProcessRunner:
                 }
 
             except Exception as e:
+                # STDIO write failed, process not running, etc. — restart and retry.
                 last_error = str(e)
                 if attempt < max_retries:
                     logger.warning(f"{self.config.name} retry {attempt + 1}/{max_retries}: {e}")
@@ -519,14 +529,33 @@ class ProcessRunner:
         if "id" not in request:
             request = {**request, "id": self._next_id()}
 
-        return await self._send_request(request, timeout=settings.TOOL_CALL_TIMEOUT)
+        try:
+            return await self._send_request(request, timeout=settings.TOOL_CALL_TIMEOUT)
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32603,
+                    "message": str(e)
+                }
+            }
 
     def _next_id(self) -> int:
         self._request_id += 1
         return self._request_id
 
     async def _send_request(self, request: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-        """Send a request and wait for response."""
+        """
+        Send a request and wait for response.
+
+        Returns the subprocess response dict on success.
+        Raises asyncio.TimeoutError if no response within timeout.
+        Raises RuntimeError/Exception on connection/process errors.
+
+        Callers can use exceptions to distinguish local failures (process crash,
+        timeout) from remote errors forwarded by the subprocess.
+        """
         if not self._proc or not self._proc.stdin:
             raise RuntimeError("Process not running")
 
@@ -548,26 +577,9 @@ class ProcessRunner:
             # Wait for response
             return await asyncio.wait_for(future, timeout=timeout)
 
-        except asyncio.TimeoutError:
+        except BaseException:
             self._pending_requests.pop(request_id, None)
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32603,
-                    "message": f"Request timeout after {timeout}s"
-                }
-            }
-        except Exception as e:
-            self._pending_requests.pop(request_id, None)
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32603,
-                    "message": str(e)
-                }
-            }
+            raise
 
     async def _send_notification(self, notification: dict[str, Any]):
         """Send a notification (no response expected)."""

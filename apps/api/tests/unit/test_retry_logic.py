@@ -77,23 +77,30 @@ class TestProcessRunnerRetry:
         runner._restart_process.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_retry_on_internal_error(self, runner):
-        """Should retry on internal error (-32603)."""
+    async def test_no_retry_on_remote_internal_error(self, runner):
+        """Should NOT retry on remote -32603 errors (subprocess responded normally).
+
+        When _send_request returns (doesn't raise), it means the subprocess
+        responded via STDIO. Even if the response contains a -32603 error,
+        the process is healthy — the error was forwarded from a remote server
+        (e.g. mcp-remote proxying a business error). No restart needed.
+        """
         runner.ensure_ready = AsyncMock(return_value=True)
         runner._restart_process = AsyncMock()
-        # First call returns error, second succeeds
-        runner._send_request = AsyncMock(side_effect=[
-            {"jsonrpc": "2.0", "error": {"code": -32603, "message": "Internal error"}},
-            {"jsonrpc": "2.0", "id": 1, "result": {"success": True}}
-        ])
+        # Remote error forwarded through mcp-remote as -32603
+        runner._send_request = AsyncMock(return_value={
+            "jsonrpc": "2.0",
+            "error": {"code": -32603, "message": "An error occurred"}
+        })
 
         with patch('app.core.process_runner.settings') as mock_settings:
             mock_settings.TOOL_CALL_TIMEOUT = 10.0
             result = await runner.call_tool("test_tool", {}, max_retries=2)
 
-        assert "result" in result
-        assert runner._send_request.call_count == 2
-        runner._restart_process.assert_called_once()
+        assert "error" in result
+        assert result["error"]["code"] == -32603
+        runner._send_request.assert_called_once()  # No retry
+        runner._restart_process.assert_not_called()  # No restart
 
     @pytest.mark.asyncio
     async def test_no_retry_on_application_error(self, runner):
@@ -136,6 +143,43 @@ class TestProcessRunnerRetry:
         # First call raises exception, second succeeds
         runner._send_request = AsyncMock(side_effect=[
             Exception("Connection lost"),
+            {"jsonrpc": "2.0", "id": 1, "result": {"success": True}}
+        ])
+
+        with patch('app.core.process_runner.settings') as mock_settings:
+            mock_settings.TOOL_CALL_TIMEOUT = 10.0
+            result = await runner.call_tool("test_tool", {}, max_retries=2)
+
+        assert "result" in result
+        assert runner._send_request.call_count == 2
+        runner._restart_process.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_retry_on_remote_server_error(self, runner):
+        """Should NOT retry on -32000 errors from remote servers."""
+        runner.ensure_ready = AsyncMock(return_value=True)
+        runner._restart_process = AsyncMock()
+        runner._send_request = AsyncMock(return_value={
+            "jsonrpc": "2.0",
+            "error": {"code": -32000, "message": "Server error from remote"}
+        })
+
+        with patch('app.core.process_runner.settings') as mock_settings:
+            mock_settings.TOOL_CALL_TIMEOUT = 10.0
+            result = await runner.call_tool("test_tool", {}, max_retries=2)
+
+        assert "error" in result
+        runner._send_request.assert_called_once()
+        runner._restart_process.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_on_process_crash_exception(self, runner):
+        """Should retry when _send_request raises (process crash/STDIO failure)."""
+        runner.ensure_ready = AsyncMock(return_value=True)
+        runner._restart_process = AsyncMock()
+        # First call: process crashes (raises), second call: succeeds
+        runner._send_request = AsyncMock(side_effect=[
+            RuntimeError("Process not running"),
             {"jsonrpc": "2.0", "id": 1, "result": {"success": True}}
         ])
 
